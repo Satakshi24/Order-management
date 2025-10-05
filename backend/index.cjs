@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 const orderRoutes = require('./routes/orders.cjs');
-const prisma = require('./db');
+const prisma = require('./db.cjs');
 app.get('/health', async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;

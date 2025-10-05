@@ -26,7 +26,7 @@ model Order {
   id        Int         @id @default(autoincrement())
   userId    Int
   user      User        @relation(fields: [userId], references: [id])
-  status    String      @default("PENDING") // <-- if you have this
+  status    String      @default("PENDING") 
   createdAt DateTime    @default(now())
   items     OrderItem[]
 }

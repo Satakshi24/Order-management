@@ -71,7 +71,7 @@ router.get('/', async (req, res) => {
     res.json(payload);
   } catch (err) {
     console.error('GET /orders error', err);
-    res.status(500).json({ error: 'Error fetching orders' });
+    res.status(500).json({ error: 'Error fetching orders', detail: String(err) });
   }
 });
 
@@ -165,8 +165,8 @@ router.post('/', async (req, res) => {
       })),
     });
   } catch (err) {
-    console.error('POST /orders error', err);
-    res.status(500).json({ error: 'Error creating order' });
+    console.error('POST /orders error', err);  
+    res.status(500).json({ error: 'Error fetching orders', detail: String(err) });
   }
 });
 

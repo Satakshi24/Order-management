@@ -17,7 +17,6 @@ app.use(cors({
   allowedHeaders: ['Content-Type'],
   maxAge: 86400,
 }));
-app.options('/(.*)', cors());
 
 app.use(express.json());
 app.use('/orders', orderRoutes);

@@ -10,15 +10,16 @@ datasource db {
 
 model User {
   id     Int     @id @default(autoincrement())
-  email  String?
-  name   String?
+  email  String
+  name   String
   orders Order[]
 }
 
 model Product {
-  id         Int         @id @default(autoincrement())
-  name       String
-  price      Float
+  id       Int      @id @default(autoincrement())
+  name     String
+  price    Float
+  stock    Int
   orderItems OrderItem[]
 }
 

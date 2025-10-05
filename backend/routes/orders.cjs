@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const prisma = require('../db');
+const prisma = require('../db.cjs');
 const { cacheGet, cacheSet, cacheDelByPrefix } = require('../redis.cjs');
 
 /**

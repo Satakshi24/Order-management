@@ -2,7 +2,16 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 const orderRoutes = require('./routes/orders.cjs');
-
+const prisma = require('./db');
+app.get('/health', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('HEALTH ERROR:', e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 app.use(cors({ origin: '*' }));
 const allowedOrigins = new Set([
   'http://localhost:5173',

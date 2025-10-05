@@ -1,154 +1,172 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../db');
-const { redis, cacheGet, cacheSet, cacheDelByPrefix } = require('../redis.cjs');
+
+const prisma = require('../db');
+const { cacheGet, cacheSet, cacheDelByPrefix } = require('../redis.cjs');
 
 /**
  * GET /orders?page=&limit=&q=
- * - pagination: page, limit
- * - search (optional): q — matches user email OR product name
- * - 30s Redis cache
+ * - Pagination: page (default 1), limit (default 10)
+ * - Search: q (matches user email OR product name; case-insensitive)
+ * - Caching: 30s TTL; invalidated on create
  */
 router.get('/', async (req, res) => {
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-  const limit = Math.max(parseInt(req.query.limit || '10', 10), 1);
-  const q = (req.query.q || '').trim();
-  const offset = (page - 1) * limit;
-
-  const cacheKey = `orders:list:p=${page}:l=${limit}:q=${q}`;
   try {
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const limit = Math.max(parseInt(req.query.limit || '10', 10), 1);
+    const q = (req.query.q || '').trim();
+    const skip = (page - 1) * limit;
+
+    const cacheKey = `orders:list:p=${page}:l=${limit}:q=${q}`;
     const cached = await cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
-    // where clause for search
+    // Build where clause
     const where = q
-      ? `
-        WHERE u.email ILIKE $1
-           OR EXISTS (
-              SELECT 1 FROM order_items oi
-              JOIN products p2 ON p2.id = oi.product_id
-              WHERE oi.order_id = o.id AND p2.name ILIKE $1
-           )
-      `
-      : '';
+      ? {
+          OR: [
+            { user: { email: { contains: q, mode: 'insensitive' } } },
+            {
+              items: {
+                some: { product: { name: { contains: q, mode: 'insensitive' } } },
+              },
+            },
+          ],
+        }
+      : {};
 
-    const params = q ? [`%${q}%`, limit, offset] : [limit, offset];
+    const [total, rows] = await Promise.all([
+      prisma.order.count({ where }),
+      prisma.order.findMany({
+        where,
+        include: {
+          user: true,
+          items: { include: { product: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+    ]);
 
-    const totalSql = `
-      SELECT COUNT(*)::int AS total
-      FROM orders o
-      JOIN users u ON u.id = o.user_id
-      ${q ? 'WHERE u.email ILIKE $1 OR EXISTS (SELECT 1 FROM order_items oi JOIN products p2 ON p2.id = oi.product_id WHERE oi.order_id = o.id AND p2.name ILIKE $1)' : ''}
-    `;
-
-    const listSql = `
-      SELECT o.id, o.status, o.created_at, u.id as user_id, u.email, u.name
-      FROM orders o
-      JOIN users u ON u.id = o.user_id
-      ${where}
-      ORDER BY o.created_at DESC
-      LIMIT $${q ? 2 : 1} OFFSET $${q ? 3 : 2}
-    `;
-
-    const totalRow = await db.query(totalSql, q ? [`%${q}%`] : []);
-    const list = await db.query(listSql, params);
-    const orderIds = list.rows.map(r => r.id);
-
-    // fetch items for these orders
-    let itemsByOrder = {};
-    if (orderIds.length) {
-      const itemsRes = await db.query(`
-        SELECT oi.id, oi.order_id, oi.quantity, p.id as product_id, p.name, p.price
-        FROM order_items oi
-        JOIN products p ON p.id = oi.product_id
-        WHERE oi.order_id = ANY($1::int[])
-      `, [orderIds]);
-      itemsRes.rows.forEach(row => {
-        if (!itemsByOrder[row.order_id]) itemsByOrder[row.order_id] = [];
-        itemsByOrder[row.order_id].push({
-          id: row.id,
-          quantity: row.quantity,
-          product: { id: row.product_id, name: row.name, price: row.price }
-        });
-      });
-    }
-
-    const data = list.rows.map(r => ({
-      id: r.id,
-      status: r.status,
-      created_at: r.created_at,
-      user: { id: r.user_id, email: r.email, name: r.name },
-      items: itemsByOrder[r.id] || [],
+    // Map to a simple shape like before
+    const data = rows.map((o) => ({
+      id: o.id,
+      status: o.status || 'PENDING',
+      created_at: o.createdAt,
+      user: { id: o.user.id, email: o.user.email, name: o.user.name },
+      items: o.items.map((it) => ({
+        id: it.id,
+        quantity: it.quantity,
+        product: {
+          id: it.product.id,
+          name: it.product.name,
+          price: it.product.price,
+        },
+      })),
     }));
 
-    const payload = { total: totalRow.rows[0].total, page, limit, data };
-    await cacheSet(cacheKey, payload, 30); // 30s TTL
+    const payload = { total, page, limit, data };
+    await cacheSet(cacheKey, payload, 30);
     res.json(payload);
   } catch (err) {
-    console.error(err);
-    res.status(500).send('Error fetching orders');
+    console.error('GET /orders error', err);
+    res.status(500).json({ error: 'Error fetching orders' });
   }
 });
 
 /**
  * POST /orders
- * { user_id: number, items: [{ product_id, quantity }] }
- * - Transactional insert (orders + order_items)
- * - Invalidate cache
- * - Mock async confirmation via Redis queue or setTimeout
+ * Body:
+ * {
+ *   "user_id": number,
+ *   "items": [{ "product_id": number, "quantity": number }]
+ * }
+ * - Transactional create (order + items)
+ * - Invalidate list caches
+ * - Mock async confirmation (PENDING -> CONFIRMED after ~2s)
  */
 router.post('/', async (req, res) => {
   const { user_id, items } = req.body || {};
 
-  if (!user_id || !Array.isArray(items) || !items.length) {
+  if (!user_id || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'user_id and items[] are required' });
   }
 
-  const client = await db.connect();
+  // Basic validation for quantities
+  for (const it of items) {
+    if (!it?.product_id || !it?.quantity || it.quantity <= 0) {
+      return res
+        .status(400)
+        .json({ error: 'Each item requires product_id and positive quantity' });
+    }
+  }
+
   try {
-    await client.query('BEGIN');
+    // Transactional create
+    const created = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.create({
+        data: {
+          user: { connect: { id: user_id } },
+          status: 'PENDING',
+        },
+      });
 
-    const orderRes = await client.query(
-      `INSERT INTO orders (user_id, status) VALUES ($1, 'PENDING') RETURNING id, user_id, status, created_at`,
-      [user_id]
-    );
-    const order = orderRes.rows[0];
+      await tx.orderItem.createMany({
+        data: items.map((it) => ({
+          orderId: order.id,
+          productId: it.product_id,
+          quantity: it.quantity,
+        })),
+      });
 
-    const values = [];
-    const placeholders = [];
-    items.forEach((it, idx) => {
-      const base = idx * 3;
-      placeholders.push(`($${base + 1}, $${base + 2}, $${base + 3})`);
-      values.push(order.id, it.product_id, it.quantity);
+      // Return with joins
+      const full = await tx.order.findUnique({
+        where: { id: order.id },
+        include: {
+          user: true,
+          items: { include: { product: true } },
+        },
+      });
+
+      return full;
     });
 
-    await client.query(
-      `INSERT INTO order_items (order_id, product_id, quantity) VALUES ${placeholders.join(',')}`,
-      values
-    );
-
-    await client.query('COMMIT');
-
-    // Invalidate all list caches
+    // Invalidate list caches
     await cacheDelByPrefix('orders:list:');
 
-    // Enqueue mock confirmation (choose one strategy)
-    // A) Simple: setTimeout that updates DB after 2s
+    // Mock async confirmation after ~2s
     setTimeout(async () => {
       try {
-        await db.query(`UPDATE orders SET status='CONFIRMED' WHERE id=$1`, [order.id]);
-        // optional: also invalidate caches so subsequent GET shows CONFIRMED
+        await prisma.order.update({
+          where: { id: created.id },
+          data: { status: 'CONFIRMED' },
+        });
         await cacheDelByPrefix('orders:list:');
-      } catch (e) { console.error('confirm job failed', e); }
+      } catch (e) {
+        console.error('Confirm job failed', e);
+      }
     }, 2000);
 
-    res.json({ ...order, items });
+    // Response shape like GET mapping
+    res.json({
+      id: created.id,
+      status: created.status,
+      created_at: created.createdAt,
+      user: { id: created.user.id, email: created.user.email, name: created.user.name },
+      items: created.items.map((it) => ({
+        id: it.id,
+        quantity: it.quantity,
+        product: {
+          id: it.product.id,
+          name: it.product.name,
+          price: it.product.price,
+        },
+      })),
+    });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).send('Error creating order');
-  } finally {
-    client.release();
+    console.error('POST /orders error', err);
+    res.status(500).json({ error: 'Error creating order' });
   }
 });
 

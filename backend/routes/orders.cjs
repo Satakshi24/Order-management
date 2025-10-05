@@ -70,7 +70,7 @@ router.get('/', async (req, res) => {
     await cacheSet(cacheKey, payload, 30);
     res.json(payload);
   } catch (err) {
-    console.error('GET /orders error', err);
+    console.error('GET /orders error', err);   // or 'POST /orders error'
     res.status(500).json({ error: 'Error fetching orders', detail: String(err) });
   }
 });
@@ -130,10 +130,25 @@ router.post('/', async (req, res) => {
       }
     }, 2000);
 
-    res.status(201).json(created);
-  } catch (e) {
-    console.error('POST /orders error:', e);
-    res.status(500).json({ error: 'Error creating order', detail: String(e) });
+    // Response shape like GET mapping
+    res.json({
+      id: created.id,
+      status: created.status,
+      created_at: created.createdAt,
+      user: { id: created.user.id, email: created.user.email, name: created.user.name },
+      items: created.items.map((it) => ({
+        id: it.id,
+        quantity: it.quantity,
+        product: {
+          id: it.product.id,
+          name: it.product.name,
+          price: it.product.price,
+        },
+      })),
+    });
+  } catch (err) {
+    console.error('POST /orders error', err);   // or 'POST /orders error'
+    res.status(500).json({ error: 'Error fetching orders', detail: String(err) });
   }
 });
 
